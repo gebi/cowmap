@@ -6,9 +6,10 @@ import (
 	"math/bits"
 	"runtime"
 	"sync/atomic"
+	"unsafe"
 )
 
-// hashSeed is a global fixed seed ensuring consistent hashing across read/write operations.
+// hashSeed is a global fixed seed ensuring consistent hashing across operations.
 var hashSeed = maphash.MakeSeed()
 
 // entry encapsulates the key-value pair.
@@ -31,7 +32,7 @@ type Map[K comparable, V any] struct {
 }
 
 // New instantiates an empty HAMT Map. It accepts an optional custom 32-bit hashing function.
-// If nil is passed, it defaults to a runtime optimized maphash strategy.
+// If nil is passed, it uses a generic maphash wrapper that handles any comparable type cleanly.
 func NewMap[K comparable, V any](customHasher func(K) uint32) *Map[K, V] {
 	m := &Map[K, V]{}
 	m.root.Store(&node[K, V]{bitmap: 0, children: nil})
@@ -42,31 +43,26 @@ func NewMap[K comparable, V any](customHasher func(K) uint32) *Map[K, V] {
 		m.hasher = func(key K) uint32 {
 			var h maphash.Hash
 			h.SetSeed(hashSeed)
-			// Utilizing Go runtime internal interface conversions for basic types
+
+			// Handle standard primitives fast paths cleanly via direct unsafe pointer matching
 			switch k := any(key).(type) {
 			case string:
 				_, _ = h.WriteString(k)
 			case int:
-				var buf [8]byte
-				*(*int)(unsafePointer(&buf[0])) = k
-				_, _ = h.Write(buf[:])
+				ptr := (*[unsafe.Sizeof(k)]byte)(unsafe.Pointer(&k))
+				_, _ = h.Write(ptr[:])
 			case int64:
-				var buf [8]byte
-				*(*int64)(unsafePointer(&buf[0])) = k
-				_, _ = h.Write(buf[:])
+				ptr := (*[8]byte)(unsafe.Pointer(&k))
+				_, _ = h.Write(ptr[:])
 			default:
-				// Fallback generic slower hashing path if type cannot be optimized inline
-				return 0
+				// Universal safe fallback for other comparable data types
+				// maphash.Comparable handles complex comparable structs/interfaces perfectly
+				return uint32(maphash.Comparable(hashSeed, key))
 			}
 			return uint32(h.Sum64())
 		}
 	}
 	return m
-}
-
-// Helper safely shortcutting type casting without importing full unsafe module overhead
-func unsafePointer(p *byte) interface{} {
-	return p
 }
 
 // --- Snapshot Reader Operations (Lock-Free) ---
@@ -140,7 +136,7 @@ func (m *Map[K, V]) Insert(key K, value V) {
 	backoff := 1
 	for {
 		currentRoot := m.root.Load()
-		newRoot := currentRoot.insert(hash, 0, key, value)
+		newRoot := currentRoot.insert(hash, 0, key, value, m.hasher)
 
 		if m.root.CompareAndSwap(currentRoot, newRoot) {
 			return
@@ -170,9 +166,9 @@ func (m *Map[K, V]) Delete(key K) bool {
 	}
 }
 
-// --- HAMTCore Structural Mutations ---
+// --- HAMT Core Structural Mutations ---
 
-func (n *node[K, V]) insert(hash uint32, shift uint, key K, value V) *node[K, V] {
+func (n *node[K, V]) insert(hash uint32, shift uint, key K, value V, hasher func(K) uint32) *node[K, V] {
 	idx := (hash >> shift) & 0x1F
 	mask := uint32(1) << idx
 	pos := bits.OnesCount32(n.bitmap & (mask - 1))
@@ -192,7 +188,7 @@ func (n *node[K, V]) insert(hash uint32, shift uint, key K, value V) *node[K, V]
 
 	// Slot holds another sub-node: propagate downwards recursively
 	if subNode, ok := child.(*node[K, V]); ok {
-		cloned.children[pos] = subNode.insert(hash, shift+5, key, value)
+		cloned.children[pos] = subNode.insert(hash, shift+5, key, value, hasher)
 		return cloned
 	}
 
@@ -206,11 +202,11 @@ func (n *node[K, V]) insert(hash uint32, shift uint, key K, value V) *node[K, V]
 
 		// Hash index collision across different keys: push down to sub-node level
 		subNode := &node[K, V]{bitmap: 0, children: nil}
-		subHash := m_hasher(existingKV.key) // local pseudo fallback reference
+		subHash := hasher(existingKV.key)
 
 		// Rehash existing and new keys downwards inside structural helper
-		subNode = subNode.insert(subHash, shift+5, existingKV.key, existingKV.value)
-		subNode = subNode.insert(hash, shift+5, key, value)
+		subNode = subNode.insert(subHash, shift+5, existingKV.key, existingKV.value, hasher)
+		subNode = subNode.insert(hash, shift+5, key, value, hasher)
 
 		cloned.children[pos] = subNode
 		return cloned
@@ -284,24 +280,6 @@ func (n *node[K, V]) clone() *node[K, V] {
 		bitmap:   n.bitmap,
 		children: newChildren,
 	}
-}
-
-func m_hasher[K comparable](key K) uint32 {
-	var h maphash.Hash
-	h.SetSeed(hashSeed)
-	switch k := any(key).(type) {
-	case string:
-		_, _ = h.WriteString(k)
-	case int:
-		var buf [8]byte
-		*(*int)(unsafePointer(&buf[0])) = k
-		_, _ = h.Write(buf[:])
-	case int64:
-		var buf [8]byte
-		*(*int64)(unsafePointer(&buf[0])) = k
-		_, _ = h.Write(buf[:])
-	}
-	return uint32(h.Sum64())
 }
 
 func executeBackoff(backoff *int) {
