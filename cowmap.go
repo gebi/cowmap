@@ -3,71 +3,41 @@ package cowmap
 import (
 	"cmp"
 	"iter"
-	"sync"
 	"sync/atomic"
 )
 
-// Node represents a 2-3 B-Tree Node.
-// A 2-Node has 1 Key, 2 Children. A 3-Node has 2 Keys, 3 Children.
 type Node[K cmp.Ordered, V any] struct {
 	Keys     []K
 	Values   []V
 	Children []*Node[K, V]
 }
 
-// Map encapsulates our lock-free root pointer and the memory recycler.
 type Map[K cmp.Ordered, V any] struct {
-	root     atomic.Pointer[Node[K, V]]
-	nodePool sync.Pool
+	root atomic.Pointer[Node[K, V]]
 }
 
 func NewMap[K cmp.Ordered, V any]() *Map[K, V] {
-	m := &Map[K, V]{}
-	m.nodePool.New = func() any {
-		return &Node[K, V]{
-			Keys:     make([]K, 0, 3), // Extra capacity for transient 4-node splits
-			Values:   make([]V, 0, 3),
-			Children: make([]*Node[K, V], 0, 4),
-		}
-	}
-	return m
+	return &Map[K, V]{}
 }
 
-// --- MEMORY RECYCLING SYSTEM ---
-
-func (m *Map[K, V]) acquireNode() *Node[K, V] {
-	n := m.nodePool.Get().(*Node[K, V])
-	n.Keys = n.Keys[:0]
-	n.Values = n.Values[:0]
-	n.Children = n.Children[:0]
-	return n
+// createNode allocates a fresh, immutable node container with isolated slice backing arrays
+func createNode[K cmp.Ordered, V any](capKeys, capChildren int) *Node[K, V] {
+	return &Node[K, V]{
+		Keys:     make([]K, 0, capKeys),
+		Values:   make([]V, 0, capKeys),
+		Children: make([]*Node[K, V], 0, capChildren),
+	}
 }
 
-// recycleTree deep-returns a speculative tree branch to the pool if a CAS write fails.
-func (m *Map[K, V]) recycleTree(n *Node[K, V], oldRoot *Node[K, V]) {
-	if n == nil || n == oldRoot {
-		return
-	}
-	// Do not recursively clean nodes belonging to the original stable tree snapshot
-	for _, child := range n.Children {
-		m.recycleTree(child, oldRoot)
-	}
-	m.nodePool.Put(n)
-}
-
-// cloneNode now forces deep isolation of underlying slice data,
-// making sure concurrent retries or edits cannot modify shared array footprints.
-func (m *Map[K, V]) cloneNode(src *Node[K, V]) *Node[K, V] {
+func cloneNode[K cmp.Ordered, V any](src *Node[K, V]) *Node[K, V] {
 	if src == nil {
 		return nil
 	}
-	dst := m.acquireNode()
-
-	// Ensure isolated backing arrays by performing a fresh append
-	// into empty slices that have sufficient capacity (cap=3 or 4)
-	dst.Keys = append(dst.Keys[:0], src.Keys...)
-	dst.Values = append(dst.Values[:0], src.Values...)
-	dst.Children = append(dst.Children[:0], src.Children...)
+	// Allocate completely isolated slices to ensure threads never share backing memory
+	dst := createNode[K, V](len(src.Keys)+1, len(src.Children)+1)
+	dst.Keys = append(dst.Keys, src.Keys...)
+	dst.Values = append(dst.Values, src.Values...)
+	dst.Children = append(dst.Children, src.Children...)
 	return dst
 }
 
@@ -94,24 +64,24 @@ func (m *Map[K, V]) Get(key K) (V, bool) {
 func (m *Map[K, V]) Insert(key K, value V) {
 	for {
 		oldRoot := m.root.Load()
-		newRoot, promotedKey, promotedVal, promotedChild := m.insert(oldRoot, key, value)
+		newRoot, _, _, promotedChild := m.insert(oldRoot, key, value)
 
 		var finalRoot *Node[K, V]
 		if newRoot != nil && len(newRoot.Keys) > 2 {
-			// Handle root split (4-node transformation into a stable 2-node parent)
-			finalRoot = m.acquireNode()
+			// Handle Root Split Transformation
+			finalRoot = createNode[K, V](3, 4)
 			mid := 1
 			finalRoot.Keys = append(finalRoot.Keys, newRoot.Keys[mid])
 			finalRoot.Values = append(finalRoot.Values, newRoot.Values[mid])
 
-			left := m.acquireNode()
+			left := createNode[K, V](3, 4)
 			left.Keys = append(left.Keys, newRoot.Keys[:mid]...)
 			left.Values = append(left.Values, newRoot.Values[:mid]...)
 			if len(newRoot.Children) > 0 {
 				left.Children = append(left.Children, newRoot.Children[:mid+1]...)
 			}
 
-			right := m.acquireNode()
+			right := createNode[K, V](3, 4)
 			right.Keys = append(right.Keys, newRoot.Keys[mid+1:]...)
 			right.Values = append(right.Values, newRoot.Values[mid+1:]...)
 			if len(newRoot.Children) > 0 {
@@ -119,12 +89,9 @@ func (m *Map[K, V]) Insert(key K, value V) {
 			}
 
 			finalRoot.Children = append(finalRoot.Children, left, right)
-			m.nodePool.Put(newRoot) // discard temporary unbalanced layout
 		} else if promotedChild != nil {
-			finalRoot = m.acquireNode()
-			finalRoot.Keys = append(finalRoot.Keys, promotedKey)
-			finalRoot.Values = append(finalRoot.Values, promotedVal)
-			finalRoot.Children = append(finalRoot.Children, oldRoot, promotedChild)
+			// This occurs if oldRoot was mutated and needs a wrapper root layer
+			finalRoot = newRoot
 		} else {
 			finalRoot = newRoot
 		}
@@ -132,8 +99,6 @@ func (m *Map[K, V]) Insert(key K, value V) {
 		if m.root.CompareAndSwap(oldRoot, finalRoot) {
 			return
 		}
-		// CAS failed. Clean up allocations before retrying to prevent heap pollution.
-		m.recycleTree(finalRoot, oldRoot)
 	}
 }
 
@@ -141,7 +106,7 @@ func (m *Map[K, V]) insert(n *Node[K, V], key K, value V) (*Node[K, V], K, V, *N
 	var zeroK K
 	var zeroV V
 	if n == nil {
-		newNode := m.acquireNode()
+		newNode := createNode[K, V](3, 4)
 		newNode.Keys = append(newNode.Keys, key)
 		newNode.Values = append(newNode.Values, value)
 		return newNode, zeroK, zeroV, nil
@@ -149,40 +114,41 @@ func (m *Map[K, V]) insert(n *Node[K, V], key K, value V) (*Node[K, V], K, V, *N
 
 	idx, found := findKey(n.Keys, key)
 	if found {
-		clone := m.cloneNode(n)
+		clone := cloneNode(n)
 		clone.Values[idx] = value
 		return clone, zeroK, zeroV, nil
 	}
 
-	if len(n.Children) == 0 { // Leaf node insertion
-		clone := m.cloneNode(n)
+	if len(n.Children) == 0 { // Leaf node element insertion
+		clone := cloneNode(n)
 		clone.Keys = insertAt(clone.Keys, idx, key)
 		clone.Values = insertAt(clone.Values, idx, value)
 		return clone, zeroK, zeroV, nil
 	}
 
-	// Internal node traversal
+	// Internal node down traversal
 	subRoot, pKey, pVal, pChild := m.insert(n.Children[idx], key, value)
-	clone := m.cloneNode(n)
+	clone := cloneNode(n)
 	clone.Children[idx] = subRoot
 
 	if pChild != nil || (subRoot != nil && len(subRoot.Keys) > 2) {
-		// Bubble up splitting node logic
 		var k K
 		var v V
 		var c *Node[K, V]
+
 		if subRoot != nil && len(subRoot.Keys) > 2 {
 			mid := 1
 			k = subRoot.Keys[mid]
 			v = subRoot.Values[mid]
 
-			right := m.acquireNode()
+			right := createNode[K, V](3, 4)
 			right.Keys = append(right.Keys, subRoot.Keys[mid+1:]...)
 			right.Values = append(right.Values, subRoot.Values[mid+1:]...)
 			if len(subRoot.Children) > 0 {
 				right.Children = append(right.Children, subRoot.Children[mid+1:]...)
 			}
 
+			// Mutate locally isolated structural branch descriptors
 			subRoot.Keys = subRoot.Keys[:mid]
 			subRoot.Values = subRoot.Values[:mid]
 			if len(subRoot.Children) > 0 {
@@ -211,7 +177,6 @@ func (m *Map[K, V]) Delete(key K) bool {
 
 		newRoot, removed := m.delete(oldRoot, key)
 		if !removed {
-			m.recycleTree(newRoot, oldRoot)
 			return false
 		}
 
@@ -222,80 +187,90 @@ func (m *Map[K, V]) Delete(key K) bool {
 			} else {
 				finalRoot = nil
 			}
-			m.nodePool.Put(newRoot)
 		}
 
 		if m.root.CompareAndSwap(oldRoot, finalRoot) {
 			return true
 		}
-		m.recycleTree(finalRoot, oldRoot)
 	}
 }
 
 func (m *Map[K, V]) delete(n *Node[K, V], key K) (*Node[K, V], bool) {
+	if n == nil || len(n.Keys) == 0 {
+		return nil, false
+	}
+
 	idx, found := findKey(n.Keys, key)
 
-	if len(n.Children) == 0 { // Leaf Node
+	if len(n.Children) == 0 { // Leaf Node deletion match execution
 		if !found {
 			return nil, false
 		}
-		clone := m.cloneNode(n)
+		clone := cloneNode(n)
 		clone.Keys = removeAt(clone.Keys, idx)
 		clone.Values = removeAt(clone.Values, idx)
 		return clone, true
 	}
 
-	// Internal Node
+	// Internal Node deletion handling
 	if found {
-		// Navigate down to find the successor leaf safely
 		successorNode := n.Children[idx+1]
 		for len(successorNode.Children) > 0 {
 			successorNode = successorNode.Children[0]
 		}
 
-		// Guard clause: make sure the leaf node isn't empty before reading index 0
 		if len(successorNode.Keys) == 0 {
-			return nil, false // Force a clean retry loop iteration
+			return nil, false
 		}
 
 		succKey := successorNode.Keys[0]
 		succVal := successorNode.Values[0]
 
-		clone := m.cloneNode(n)
+		clone := cloneNode(n)
 		clone.Keys[idx] = succKey
 		clone.Values[idx] = succVal
 
 		subRoot, removed := m.delete(clone.Children[idx+1], succKey)
 		if !removed {
-			m.recycleTree(clone, nil)
 			return nil, false
 		}
 		clone.Children[idx+1] = subRoot
 		return m.balanceDeletion(clone, idx+1), true
 	}
 
+	if idx >= len(n.Children) {
+		return nil, false
+	}
+
 	subRoot, removed := m.delete(n.Children[idx], key)
 	if !removed {
 		return nil, false
 	}
-	clone := m.cloneNode(n)
+	clone := cloneNode(n)
 	clone.Children[idx] = subRoot
 	return m.balanceDeletion(clone, idx), true
 }
 
 func (m *Map[K, V]) balanceDeletion(n *Node[K, V], idx int) *Node[K, V] {
+	if idx >= len(n.Children) {
+		return n
+	}
 	target := n.Children[idx]
 	if target != nil && len(target.Keys) > 0 {
-		return n // Subtree is structurally stable
+		return n
 	}
 
-	// Handle underflow merge/borrow semantics with adjacent siblings
-	if idx > 0 && len(n.Children[idx-1].Keys) > 1 { // Borrow from left sibling
-		left := m.cloneNode(n.Children[idx-1])
-		currTarget := m.cloneNode(target)
+	// Borrow from left sibling
+	if idx > 0 && idx-1 < len(n.Children) && len(n.Children[idx-1].Keys) > 1 {
+		left := cloneNode(n.Children[idx-1])
+		currTarget := cloneNode(target)
+		if currTarget == nil {
+			currTarget = createNode[K, V](3, 4)
+		}
 
 		currTarget.Keys = insertAt(currTarget.Keys, 0, n.Keys[idx-1])
 		currTarget.Values = insertAt(currTarget.Values, 0, n.Values[idx-1])
+
 		n.Keys[idx-1] = left.Keys[len(left.Keys)-1]
 		n.Values[idx-1] = left.Values[len(left.Values)-1]
 
@@ -310,7 +285,6 @@ func (m *Map[K, V]) balanceDeletion(n *Node[K, V], idx int) *Node[K, V] {
 		n.Children[idx] = currTarget
 		return n
 	}
-	// Fallback to structural compaction merges for space optimization
 	return n
 }
 
@@ -337,138 +311,26 @@ func insertAt[T any](slice []T, idx int, val T) []T {
 }
 
 func removeAt[T any](slice []T, idx int) []T {
-	// Guard against accidental underflows if structural sizes shifted
 	if idx < 0 || idx >= len(slice) {
 		return slice
 	}
 	return append(slice[:idx], slice[idx+1:]...)
 }
 
-/*
-func main() {
-	bTreeMap := NewMap[int, string]()
-	bTreeMap.Insert(42, "B-Tree Layout")
-	bTreeMap.Insert(10, "Cache Friendly")
+// --- STANDARD LIBRARY ITERATOR SUPPORT ---
 
-	if val, ok := bTreeMap.Get(42); ok {
-		fmt.Printf("Get -> 42: %s\n", val)
-	}
-
-	bTreeMap.Delete(42)
-	_, found := bTreeMap.Get(42)
-	fmt.Printf("Get after Delete -> 42 Found? %t\n", found)
-}
-*/
-
-// Iterator represents a point-in-time snapshot scanner for range queries.
-type Iterator[K cmp.Ordered, V any] struct {
-	stack          []*Node[K, V]
-	indices        []int
-	min, max       K
-	hasMin, hasMax bool
-}
-
-// Iterator creates an O(1) lock-free snapshot range iterator.
-// Pass hasMin/hasMax as false to perform open-ended bounds (e.g. scanning the entire map).
-func (m *Map[K, V]) Iterator(min, max K, hasMin, hasMax bool) *Iterator[K, V] {
-	root := m.root.Load() // Capture structural snapshot instantly
-	it := &Iterator[K, V]{
-		stack:   make([]*Node[K, V], 0, 8),
-		indices: make([]int, 0, 8),
-		min:     min,
-		max:     max,
-		hasMin:  hasMin,
-		hasMax:  hasMax,
-	}
-	if root != nil {
-		it.pushLeft(root)
-	}
-	return it
-}
-
-// pushLeft descends down to the leftmost valid key matching our range criteria.
-func (it *Iterator[K, V]) pushLeft(n *Node[K, V]) {
-	curr := n
-	for curr != nil {
-		it.stack = append(it.stack, curr)
-
-		// Find where to start inside this node based on the minimum boundary
-		idx := 0
-		if it.hasMin {
-			for idx < len(curr.Keys) && curr.Keys[idx] < it.min {
-				idx++
-			}
-		}
-		it.indices = append(it.indices, idx)
-
-		if len(curr.Children) > 0 {
-			curr = curr.Children[idx]
-		} else {
-			curr = nil
-		}
-	}
-}
-
-// Next advances the iterator and returns the next Key-Value pair inside the range.
-func (it *Iterator[K, V]) Next() (K, V, bool) {
-	var zeroK K
-	var zeroV V
-
-	for len(it.stack) > 0 {
-		depth := len(it.stack) - 1
-		curr := it.stack[depth]
-		idx := it.indices[depth]
-
-		// If we processed all keys in this node, pop it off the stack
-		if idx >= len(curr.Keys) {
-			it.stack = it.stack[:depth]
-			it.indices = it.indices[:depth]
-
-			// Move the parent index forward since we just finished its child subtree
-			if len(it.indices) > 0 {
-				it.indices[len(it.indices)-1]++
-			}
-			continue
-		}
-
-		key := curr.Keys[idx]
-		val := curr.Values[idx]
-
-		// Check upper limit bound
-		if it.hasMax && key > it.max {
-			it.stack = nil // Terminate early
-			return zeroK, zeroV, false
-		}
-
-		// Advance index for the next iteration step on this node
-		it.indices[depth]++
-
-		// If this node has children, we must push the right-side child subtree onto the stack
-		if len(curr.Children) > 0 {
-			it.pushLeft(curr.Children[idx+1])
-		}
-
-		// Return the valid key-value match
-		return key, val, true
-	}
-
-	return zeroK, zeroV, false
-}
-
-// All returns a standard Go 1.23+ sequence iterator for the entire map.
-// This allows using the map directly within 'for k, v := range m.All()' loops.
 func (m *Map[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		root := m.root.Load() // Capture the point-in-time snapshot instantly
+		root := m.root.Load()
 		if root == nil {
 			return
 		}
 
-		// Use a local, non-allocating stack loop for traversal
 		stack := make([]*Node[K, V], 0, 8)
 		indices := make([]int, 0, 8)
 
-		pushLeft := func(n *Node[K, V]) {
+		var pushLeft func(n *Node[K, V])
+		pushLeft = func(n *Node[K, V]) {
 			curr := n
 			for curr != nil {
 				stack = append(stack, curr)
@@ -501,12 +363,10 @@ func (m *Map[K, V]) All() iter.Seq2[K, V] {
 			val := curr.Values[idx]
 
 			indices[depth]++
-			if len(curr.Children) > 0 {
+			if len(curr.Children) > idx+1 {
 				pushLeft(curr.Children[idx+1])
 			}
 
-			// yield sends the key-value pair back to the caller's for-range loop.
-			// If the loop encounters a 'break', yield returns false, ending traversal early.
 			if !yield(key, val) {
 				return
 			}
@@ -515,9 +375,10 @@ func (m *Map[K, V]) All() iter.Seq2[K, V] {
 }
 
 // Range returns a standard sequence iterator bounded between min and max keys.
+// This allows using native loops like 'for k, v := range m.Range(20, 45)' safely.
 func (m *Map[K, V]) Range(min, max K) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		root := m.root.Load()
+		root := m.root.Load() // Capture structural snapshot instantly
 		if root == nil {
 			return
 		}
@@ -525,16 +386,22 @@ func (m *Map[K, V]) Range(min, max K) iter.Seq2[K, V] {
 		stack := make([]*Node[K, V], 0, 8)
 		indices := make([]int, 0, 8)
 
-		pushLeftBounded := func(n *Node[K, V]) {
+		// Bounded push function that finds the first valid starting point in a branch
+		var pushLeftBounded func(n *Node[K, V])
+		pushLeftBounded = func(n *Node[K, V]) {
 			curr := n
 			for curr != nil {
 				stack = append(stack, curr)
+
+				// Find where to start inside this node based on the minimum boundary
 				idx := 0
 				for idx < len(curr.Keys) && curr.Keys[idx] < min {
 					idx++
 				}
 				indices = append(indices, idx)
-				if len(curr.Children) > 0 {
+
+				// Follow down to the correct child branch if it exists
+				if len(curr.Children) > idx {
 					curr = curr.Children[idx]
 				} else {
 					curr = nil
@@ -549,6 +416,7 @@ func (m *Map[K, V]) Range(min, max K) iter.Seq2[K, V] {
 			curr := stack[depth]
 			idx := indices[depth]
 
+			// If we processed all keys in this node, pop it off the stack
 			if idx >= len(curr.Keys) {
 				stack = stack[:depth]
 				indices = indices[:depth]
@@ -561,15 +429,17 @@ func (m *Map[K, V]) Range(min, max K) iter.Seq2[K, V] {
 			key := curr.Keys[idx]
 			val := curr.Values[idx]
 
+			// Since keys are ordered, if we exceed the high boundary, we can terminate early
 			if key > max {
-				return // Exceeded high bounds boundary, stop traversal
+				return
 			}
 
 			indices[depth]++
-			if len(curr.Children) > 0 {
+			if len(curr.Children) > idx+1 {
 				pushLeftBounded(curr.Children[idx+1])
 			}
 
+			// yield returns false if the consumer uses a 'break' statement
 			if !yield(key, val) {
 				return
 			}
