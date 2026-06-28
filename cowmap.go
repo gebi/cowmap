@@ -7,497 +7,368 @@ import (
 	"sync/atomic"
 )
 
-// Erhöhung des Verzweigungsfaktors.
-// MaxKeys = 15 bedeutet, dass ein Node perfekt in typische CPU-Cache-Lines passt.
-const (
-	MaxKeys  = 15
-	MinKeys  = MaxKeys / 2
-	MaxChild = MaxKeys + 1
-)
+// maxKeys defines the branching threshold optimized for CPU cache line density.
+const maxKeys = 15
+const minKeys = maxKeys / 2
 
-type Node[K cmp.Ordered, V any] struct {
-	Keys     []K
-	Values   []V
-	Children []*Node[K, V]
+type entry[K cmp.Ordered, V any] struct {
+	key   K
+	value V
 }
 
+type node[K cmp.Ordered, V any] struct {
+	keys     []entry[K, V]
+	children []*node[K, V]
+}
+
+// Map handles thread-safe lock-free generic data lookups via an immutable B-Tree.
 type Map[K cmp.Ordered, V any] struct {
-	root atomic.Pointer[Node[K, V]]
+	root atomic.Pointer[node[K, V]]
 }
 
+// New returns an instantiated empty lock-free Map.
 func NewMap[K cmp.Ordered, V any]() *Map[K, V] {
-	return &Map[K, V]{}
+	m := &Map[K, V]{}
+	m.root.Store(&node[K, V]{})
+	return m
 }
 
-func createNode[K cmp.Ordered, V any](capKeys, capChildren int) *Node[K, V] {
-	return &Node[K, V]{
-		Keys:     make([]K, 0, capKeys),
-		Values:   make([]V, 0, capKeys),
-		Children: make([]*Node[K, V], 0, capChildren),
-	}
-}
+// --- Snapshot Reads (Lock-free) ---
 
-func cloneNode[K cmp.Ordered, V any](src *Node[K, V]) *Node[K, V] {
-	if src == nil {
-		return nil
-	}
-	dst := createNode[K, V](len(src.Keys)+1, len(src.Children)+1)
-	dst.Keys = append(dst.Keys, src.Keys...)
-	dst.Values = append(dst.Values, src.Values...)
-	dst.Children = append(dst.Children, src.Children...)
-	return dst
-}
-
+// Get searches for a key and returns the associated value and existence flag.
 func (m *Map[K, V]) Get(key K) (V, bool) {
-	curr := m.root.Load()
-	for curr != nil {
-		idx, found := findKey(curr.Keys, key)
-		if found {
-			return curr.Values[idx], true
-		}
-		if len(curr.Children) == 0 {
-			break
-		}
-		curr = curr.Children[idx]
-	}
-	var zero V
-	return zero, false
+	return m.root.Load().search(key)
 }
 
+func (n *node[K, V]) search(key K) (V, bool) {
+	idx, found := n.findKey(key)
+	if found {
+		return n.keys[idx].value, true
+	}
+	if n.isLeaf() {
+		var zero V
+		return zero, false
+	}
+	return n.children[idx].search(key)
+}
+
+// All exposes a Go 1.23 functional sequence iterator over all sorted key-value pairs.
+func (m *Map[K, V]) All() iter.Seq2[K, V] {
+	snapshot := m.root.Load()
+	return func(yield func(K, V) bool) {
+		snapshot.iterate(yield)
+	}
+}
+
+func (n *node[K, V]) iterate(yield func(K, V) bool) bool {
+	for i := 0; i < len(n.keys); i++ {
+		if !n.isLeaf() {
+			if !n.children[i].iterate(yield) {
+				return false
+			}
+		}
+		if !yield(n.keys[i].key, n.keys[i].value) {
+			return false
+		}
+	}
+	if !n.isLeaf() {
+		return n.children[len(n.keys)].iterate(yield)
+	}
+	return true
+}
+
+// Range exposes an isolated iterator over the key boundary spectrum [low, high].
+func (m *Map[K, V]) Range(low, high K) iter.Seq2[K, V] {
+	snapshot := m.root.Load()
+	return func(yield func(K, V) bool) {
+		snapshot.iterateRange(low, high, yield)
+	}
+}
+
+func (n *node[K, V]) iterateRange(low, high K, yield func(K, V) bool) bool {
+	for i := 0; i < len(n.keys); i++ {
+		if !n.isLeaf() && n.keys[i].key >= low {
+			if !n.children[i].iterateRange(low, high, yield) {
+				return false
+			}
+		}
+		if n.keys[i].key >= low && n.keys[i].key <= high {
+			if !yield(n.keys[i].key, n.keys[i].value) {
+				return false
+			}
+		}
+		if n.keys[i].key > high {
+			return true
+		}
+	}
+	if !n.isLeaf() && (len(n.keys) == 0 || n.keys[len(n.keys)-1].key <= high) {
+		return n.children[len(n.keys)].iterateRange(low, high, yield)
+	}
+	return true
+}
+
+// --- CAS Write Loops (Adaptive Backoff) ---
+
+// Insert safely inserts or overwrites a value associated with the specified key.
 func (m *Map[K, V]) Insert(key K, value V) {
 	backoff := 1
 	for {
-		oldRoot := m.root.Load()
-		newRoot, promotedKey, promotedVal, promotedChild := m.insert(oldRoot, key, value)
+		currentRoot := m.root.Load()
+		newRoot := currentRoot.clone()
 
-		var finalRoot *Node[K, V]
-		if newRoot != nil && len(newRoot.Keys) > MaxKeys {
-			// Splitting des überfüllten Nodes auf Root-Ebene
-			finalRoot = createNode[K, V](MaxKeys+1, MaxChild+1)
-			mid := len(newRoot.Keys) / 2
-			finalRoot.Keys = append(finalRoot.Keys, newRoot.Keys[mid])
-			finalRoot.Values = append(finalRoot.Values, newRoot.Values[mid])
-
-			left := createNode[K, V](MaxKeys+1, MaxChild+1)
-			left.Keys = append(left.Keys, newRoot.Keys[:mid]...)
-			left.Values = append(left.Values, newRoot.Values[:mid]...)
-			if len(newRoot.Children) > 0 {
-				left.Children = append(left.Children, newRoot.Children[:mid+1]...)
+		promotedKey, promotedChild := newRoot.insert(key, value)
+		if promotedChild != nil {
+			var zero V
+			oldRoot := newRoot
+			newRoot = &node[K, V]{
+				keys:     []entry[K, V]{{key: promotedKey, value: zero}},
+				children: []*node[K, V]{oldRoot, promotedChild},
 			}
-
-			right := createNode[K, V](MaxKeys+1, MaxChild+1)
-			right.Keys = append(right.Keys, newRoot.Keys[mid+1:]...)
-			right.Values = append(right.Values, newRoot.Values[mid+1:]...)
-			if len(newRoot.Children) > 0 {
-				right.Children = append(right.Children, newRoot.Children[mid+1:]...)
-			}
-
-			finalRoot.Children = append(finalRoot.Children, left, right)
-		} else if promotedChild != nil {
-			finalRoot = createNode[K, V](MaxKeys+1, MaxChild+1)
-			finalRoot.Keys = append(finalRoot.Keys, promotedKey)
-			finalRoot.Values = append(finalRoot.Values, promotedVal)
-			finalRoot.Children = append(finalRoot.Children, oldRoot, promotedChild)
-		} else {
-			finalRoot = newRoot
 		}
 
-		if m.root.CompareAndSwap(oldRoot, finalRoot) {
+		if m.root.CompareAndSwap(currentRoot, newRoot) {
 			return
 		}
-
-		// CAS fehlgeschlagen: Exponentielles Backoff einführen, um CPU Churn zu drosseln
-		for i := 0; i < backoff; i++ {
-			runtime.Gosched()
-		}
-		if backoff < 64 {
-			backoff <<= 1
-		}
+		executeBackoff(&backoff)
 	}
 }
 
-func (m *Map[K, V]) insert(n *Node[K, V], key K, value V) (*Node[K, V], K, V, *Node[K, V]) {
-	var zeroK K
-	var zeroV V
-	if n == nil {
-		newNode := createNode[K, V](MaxKeys+1, MaxChild+1)
-		newNode.Keys = append(newNode.Keys, key)
-		newNode.Values = append(newNode.Values, value)
-		return newNode, zeroK, zeroV, nil
-	}
-
-	idx, found := findKey(n.Keys, key)
-	if found {
-		clone := cloneNode(n)
-		clone.Values[idx] = value
-		return clone, zeroK, zeroV, nil
-	}
-
-	if len(n.Children) == 0 {
-		clone := cloneNode(n)
-		clone.Keys = insertAt(clone.Keys, idx, key)
-		clone.Values = insertAt(clone.Values, idx, value)
-		return clone, zeroK, zeroV, nil
-	}
-
-	subRoot, pKey, pVal, pChild := m.insert(n.Children[idx], key, value)
-	clone := cloneNode(n)
-	clone.Children[idx] = subRoot
-
-	if pChild != nil || (subRoot != nil && len(subRoot.Keys) > MaxKeys) {
-		var k K
-		var v V
-		var c *Node[K, V]
-
-		if subRoot != nil && len(subRoot.Keys) > MaxKeys {
-			mid := len(subRoot.Keys) / 2
-			k = subRoot.Keys[mid]
-			v = subRoot.Values[mid]
-
-			right := createNode[K, V](MaxKeys+1, MaxChild+1)
-			right.Keys = append(right.Keys, subRoot.Keys[mid+1:]...)
-			right.Values = append(right.Values, subRoot.Values[mid+1:]...)
-			if len(subRoot.Children) > 0 {
-				right.Children = append(right.Children, subRoot.Children[mid+1:]...)
-			}
-
-			subRoot.Keys = subRoot.Keys[:mid]
-			subRoot.Values = subRoot.Values[:mid]
-			if len(subRoot.Children) > 0 {
-				subRoot.Children = subRoot.Children[:mid+1]
-			}
-			c = right
-		} else {
-			k, v, c = pKey, pVal, pChild
-		}
-
-		clone.Keys = insertAt(clone.Keys, idx, k)
-		clone.Values = insertAt(clone.Values, idx, v)
-		clone.Children = insertAt(clone.Children, idx+1, c)
-	}
-	return clone, zeroK, zeroV, nil
-}
-
-// Delete entfernt einen Schlüssel aus der Map via Lock-Free CAS (O(log n)).
-// Gibt true zurück, wenn das Element gelöscht wurde, andernfalls false.
+// Delete drops a targeted key from the node tree and balance shifts.
 func (m *Map[K, V]) Delete(key K) bool {
 	backoff := 1
 	for {
-		oldRoot := m.root.Load()
-		if oldRoot == nil {
+		currentRoot := m.root.Load()
+		_, found := currentRoot.search(key)
+		if !found {
 			return false
 		}
 
-		newRoot, removed := m.delete(oldRoot, key)
-		if !removed {
-			return false // Schlüssel existiert nicht, kein CAS notwendig
+		newRoot := currentRoot.clone()
+		newRoot.delete(key)
+
+		if len(newRoot.keys) == 0 && !newRoot.isLeaf() {
+			newRoot = newRoot.children[0]
 		}
 
-		var finalRoot *Node[K, V] = newRoot
-		// Wenn die Wurzel nach dem Löschen leer ist, rückt die Kind-Ebene nach oben nach
-		if newRoot != nil && len(newRoot.Keys) == 0 {
-			if len(newRoot.Children) > 0 {
-				finalRoot = newRoot.Children[0]
-			} else {
-				finalRoot = nil
-			}
-		}
-
-		if m.root.CompareAndSwap(oldRoot, finalRoot) {
+		if m.root.CompareAndSwap(currentRoot, newRoot) {
 			return true
 		}
-
-		// CAS fehlgeschlagen: Exponentielles Backoff zur Entlastung der CPU
-		for i := 0; i < backoff; i++ {
-			runtime.Gosched()
-		}
-		if backoff < 64 {
-			backoff <<= 1
-		}
+		executeBackoff(&backoff)
 	}
 }
 
-func (m *Map[K, V]) delete(n *Node[K, V], key K) (*Node[K, V], bool) {
-	if n == nil || len(n.Keys) == 0 {
-		return nil, false
-	}
+// --- B-Tree Isolation Mechanics ---
 
-	idx, found := findKey(n.Keys, key)
-
-	// Fall 1: Wir befinden uns in einem Blattknoten
-	if len(n.Children) == 0 {
-		if !found {
-			return nil, false
-		}
-		clone := cloneNode(n)
-		clone.Keys = removeAt(clone.Keys, idx)
-		clone.Values = removeAt(clone.Values, idx)
-		return clone, true
-	}
-
-	// Fall 2: Der Schlüssel befindet sich in einem internen Knoten
+func (n *node[K, V]) insert(key K, value V) (K, *node[K, V]) {
+	idx, found := n.findKey(key)
 	if found {
-		// Nachfolger (In-Order Successor) aus dem rechten Teilbaum extrahieren
-		successorNode := n.Children[idx+1]
-		for len(successorNode.Children) > 0 {
-			successorNode = successorNode.Children
-		}
-
-		if len(successorNode.Keys) == 0 {
-			return nil, false
-		}
-
-		succKey := successorNode.Keys[0]
-		succVal := successorNode.Values[0]
-
-		clone := cloneNode(n)
-		clone.Keys[idx] = succKey
-		clone.Values[idx] = succVal
-
-		// Den Nachfolger-Key aus dem rechten Teilbaum löschen
-		subRoot, removed := m.delete(clone.Children[idx+1], succKey)
-		if !removed {
-			return nil, false
-		}
-		clone.Children[idx+1] = subRoot
-		return m.balanceDeletion(clone, idx+1), true
+		n.keys[idx].value = value
+		var zero K
+		return zero, nil
 	}
 
-	// Fall 3: Der Schlüssel liegt tiefer im Baum verborgen
-	if idx >= len(n.Children) {
-		return nil, false
+	if n.isLeaf() {
+		n.keys = append(n.keys, entry[K, V]{})
+		copy(n.keys[idx+1:], n.keys[idx:])
+		n.keys[idx] = entry[K, V]{key: key, value: value}
+	} else {
+		n.children[idx] = n.children[idx].clone()
+		pKey, pChild := n.children[idx].insert(key, value)
+		if pChild != nil {
+			return n.splitChild(idx, pKey, pChild)
+		}
 	}
 
-	subRoot, removed := m.delete(n.Children[idx], key)
-	if !removed {
-		return nil, false
+	if len(n.keys) > maxKeys {
+		return n.splitSelf()
 	}
-	clone := cloneNode(n)
-	clone.Children[idx] = subRoot
-	return m.balanceDeletion(clone, idx), true
+	var zero K
+	return zero, nil
 }
 
-// balanceDeletion korrigiert etwaige Unterläufe (Underflows) nach dem Entfernen von Elementen
-func (m *Map[K, V]) balanceDeletion(n *Node[K, V], idx int) *Node[K, V] {
-	if idx >= len(n.Children) {
-		return n
+func (n *node[K, V]) splitChild(idx int, pKey K, pChild *node[K, V]) (K, *node[K, V]) {
+	var zero V
+	n.keys = append(n.keys, entry[K, V]{})
+	copy(n.keys[idx+1:], n.keys[idx:])
+	n.keys[idx] = entry[K, V]{key: pKey, value: zero}
+
+	n.children = append(n.children, nil)
+	copy(n.children[idx+2:], n.children[idx+1:])
+	n.children[idx+1] = pChild
+
+	if len(n.keys) > maxKeys {
+		return n.splitSelf()
 	}
-	target := n.Children[idx]
-	// Ein Unterlauf liegt vor, wenn die Anzahl der Keys das erlaubte Minimum unterschreitet
-	if target != nil && len(target.Keys) >= MinKeys {
-		return n
-	}
-
-	// Option A: Rotieren / Ausleihen vom linken Nachbarn (Left Sibling)
-	if idx > 0 && idx-1 < len(n.Children) && len(n.Children[idx-1].Keys) > MinKeys {
-		left := cloneNode(n.Children[idx-1])
-		currTarget := cloneNode(target)
-		if currTarget == nil {
-			currTarget = createNode[K, V](MaxKeys+1, MaxChild+1)
-		}
-
-		currTarget.Keys = insertAt(currTarget.Keys, 0, n.Keys[idx-1])
-		currTarget.Values = insertAt(currTarget.Values, 0, n.Values[idx-1])
-
-		n.Keys[idx-1] = left.Keys[len(left.Keys)-1]
-		n.Values[idx-1] = left.Values[len(left.Values)-1]
-
-		left.Keys = removeAt(left.Keys, len(left.Keys)-1)
-		left.Values = removeAt(left.Values, len(left.Values)-1)
-
-		if len(left.Children) > 0 {
-			currTarget.Children = insertAt(currTarget.Children, 0, left.Children[len(left.Children)-1])
-			left.Children = removeAt(left.Children, len(left.Children)-1)
-		}
-		n.Children[idx-1] = left
-		n.Children[idx] = currTarget
-		return n
-	}
-
-	// Option B: Rotieren / Ausleihen vom rechten Nachbarn (Right Sibling)
-	if idx+1 < len(n.Children) && len(n.Children[idx+1].Keys) > MinKeys {
-		right := cloneNode(n.Children[idx+1])
-		currTarget := cloneNode(target)
-		if currTarget == nil {
-			currTarget = createNode[K, V](MaxKeys+1, MaxChild+1)
-		}
-
-		currTarget.Keys = append(currTarget.Keys, n.eys[idx])
-		currTarget.Values = append(currTarget.Values, n.Values[idx])
-
-		n.Keys[idx] = right.Keys[0]
-		n.Values[idx] = right.Values[0]
-
-		right.Keys = removeAt(right.Keys, 0)
-		right.Values = removeAt(right.Values, 0)
-
-		if len(right.Children) > 0 {
-			currTarget.Children = append(currTarget.Children, right.Children[0])
-			right.Children = removeAt(right.Children, 0)
-		}
-		n.Children[idx+1] = right
-		n.Children[idx] = currTarget
-		return n
-	}
-
-	// Option C: Verschmelzen (Merge) falls Ausleihen nicht möglich ist
-	// Für vereinfachte persistente Speicherstrukturen reicht das strukturelle Nachziehen
-	// aus den oberen Ebenen über das Re-Balancing der Elternknoten.
-	return n
+	var zeroKey K
+	return zeroKey, nil
 }
 
-func findKey[K cmp.Ordered](slice []K, key K) (int, bool) {
-	for i, k := range slice {
-		if k == key {
-			return i, true
-		}
-		if k > key {
-			return i, false
-		}
+func (n *node[K, V]) splitSelf() (K, *node[K, V]) {
+	mid := len(n.keys) / 2
+	promotedKey := n.keys[mid].key
+
+	next := &node[K, V]{
+		keys: append([]entry[K, V](nil), n.keys[mid+1:]...),
 	}
-	return len(slice), false
-}
-
-func insertAt[T any](slice []T, idx int, val T) []T {
-	var zero T
-	slice = append(slice, zero)
-	copy(slice[idx+1:], slice[idx:])
-	slice[idx] = val
-	return slice
-}
-
-func removeAt[T any](slice []T, idx int) []T {
-	if idx < 0 || idx >= len(slice) {
-		return slice
+	if !n.isLeaf() {
+		next.children = append([]*node[K, V](nil), n.children[mid+1:]...)
+		n.children = n.children[:mid+1]
 	}
-	return append(slice[:idx], slice[idx+1:]...)
+	n.keys = n.keys[:mid]
+
+	return promotedKey, next
 }
 
-// All gibt einen Go 1.23+ Standard-Sequenziterator für die gesamte Map zurück.
-// Ermöglicht die direkte Nutzung in 'for k, v := range m.All()' Schleifen.
-func (m *Map[K, V]) All() iter.Seq2[K, V] {
-	return func(yield func(K, V) bool) {
-		root := m.root.Load() // O(1) Point-in-Time Snapshot
-		if root == nil {
+func (n *node[K, V]) delete(key K) bool {
+	idx, found := n.findKey(key)
+	if n.isLeaf() {
+		if found {
+			copy(n.keys[idx:], n.keys[idx+1:])
+			n.keys = n.keys[:len(n.keys)-1]
+			return true
+		}
+		return false
+	}
+
+	if found {
+		n.children[idx+1] = n.children[idx+1].clone()
+		successor := n.children[idx+1].getMin()
+		n.keys[idx] = successor
+		n.children[idx+1].delete(successor.key)
+		n.balance(idx + 1)
+		return true
+	}
+
+	n.children[idx] = n.children[idx].clone()
+	deleted := n.children[idx].delete(key)
+	if deleted {
+		n.balance(idx)
+	}
+	return deleted
+}
+
+func (n *node[K, V]) balance(idx int) {
+	if len(n.children[idx].keys) >= minKeys {
+		return
+	}
+	if idx > 0 {
+		n.children[idx-1] = n.children[idx-1].clone()
+		if len(n.children[idx-1].keys) > minKeys {
+			n.borrowFromLeft(idx)
 			return
 		}
-
-		// Lokaler Stack zur Vermeidung von Heap-Allokationen während der Traversierung
-		stack := make([]*Node[K, V], 0, 16)
-		indices := make([]int, 0, 16)
-
-		var pushLeft func(n *Node[K, V])
-		pushLeft = func(n *Node[K, V]) {
-			curr := n
-			for curr != nil {
-				stack = append(stack, curr)
-				indices = append(indices, 0)
-				if len(curr.Children) > 0 {
-					curr = curr.Children[0]
-				} else {
-					curr = nil
-				}
-			}
+	}
+	if idx < len(n.children)-1 {
+		n.children[idx+1] = n.children[idx+1].clone()
+		if len(n.children[idx+1].keys) > minKeys {
+			n.borrowFromRight(idx)
+			return
 		}
-
-		pushLeft(root)
-
-		for len(stack) > 0 {
-			depth := len(stack) - 1
-			curr := stack[depth]
-			idx := indices[depth]
-
-			// Wenn alle Keys im aktuellen Node verarbeitet wurden, eine Ebene nach oben springen
-			if idx >= len(curr.Keys) {
-				stack = stack[:depth]
-				indices = indices[:depth]
-				if len(indices) > 0 {
-					indices[len(indices)-1]++
-				}
-				continue
-			}
-
-			key := curr.Keys[idx]
-			val := curr.Values[idx]
-
-			indices[depth]++
-			// Falls Kindelemente vorhanden sind, den Pfad des nächsten Sub-Trees auf den Stack legen
-			if len(curr.Children) > idx+1 {
-				pushLeft(curr.Children[idx+1])
-			}
-
-			// yield übergibt Key/Value an die for-range Schleife.
-			// Gibt false zurück, wenn die Schleife per 'break' abgebrochen wurde.
-			if !yield(key, val) {
-				return
-			}
-		}
+	}
+	if idx > 0 {
+		n.merge(idx - 1)
+	} else {
+		n.merge(idx)
 	}
 }
 
-// Range gibt einen Go 1.23+ Sequenziterator zurück, der auf einen Bereich zwischen min und max begrenzt ist.
-// Aufrufbar via 'for k, v := range m.Range(min, max)'.
-func (m *Map[K, V]) Range(min, max K) iter.Seq2[K, V] {
-	return func(yield func(K, V) bool) {
-		root := m.root.Load() // O(1) Point-in-Time Snapshot
-		if root == nil {
-			return
+func (n *node[K, V]) borrowFromLeft(idx int) {
+	left := n.children[idx-1]
+	right := n.children[idx]
+
+	right.keys = append(right.keys, entry[K, V]{})
+	copy(right.keys[1:], right.keys[0:])
+	right.keys[0] = n.keys[idx-1]
+	n.keys[idx-1] = left.keys[len(left.keys)-1]
+	left.keys = left.keys[:len(left.keys)-1]
+
+	if !right.isLeaf() {
+		right.children = append(right.children, nil)
+		copy(right.children[1:], right.children[0:])
+		right.children[0] = left.children[len(left.children)-1]
+		left.children = left.children[:len(left.children)-1]
+	}
+}
+
+func (n *node[K, V]) borrowFromRight(idx int) {
+	left := n.children[idx]
+	right := n.children[idx+1]
+
+	left.keys = append(left.keys, n.keys[idx])
+	n.keys[idx] = right.keys[0]
+	copy(right.keys[0:], right.keys[1:])
+	right.keys = right.keys[:len(right.keys)-1]
+
+	if !left.isLeaf() {
+		left.children = append(left.children, right.children[0])
+		copy(right.children[0:], right.children[1:])
+		right.children = right.children[:len(right.children)-1]
+	}
+}
+
+func (n *node[K, V]) merge(idx int) {
+	left := n.children[idx]
+	right := n.children[idx+1]
+
+	left.keys = append(left.keys, n.keys[idx])
+	left.keys = append(left.keys, right.keys...)
+
+	if !left.isLeaf() {
+		left.children = append(left.children, right.children...)
+	}
+
+	copy(n.keys[idx:], n.keys[idx+1:])
+	n.keys = n.keys[:len(n.keys)-1]
+
+	copy(n.children[idx+1:], n.children[idx+2:])
+	n.children = n.children[:len(n.children)-1]
+}
+
+// --- Utilities ---
+
+func (n *node[K, V]) findKey(key K) (int, bool) {
+	low, high := 0, len(n.keys)-1
+	for low <= high {
+		mid := (low + high) >> 1
+		cmpVal := cmp.Compare(key, n.keys[mid].key)
+		if cmpVal == 0 {
+			return mid, true
+		} else if cmpVal > 0 {
+			low = mid + 1
+		} else {
+			high = mid - 1
 		}
+	}
+	return low, false
+}
 
-		stack := make([]*Node[K, V], 0, 16)
-		indices := make([]int, 0, 16)
+func (n *node[K, V]) isLeaf() bool {
+	return len(n.children) == 0
+}
 
-		var pushLeftBounded func(n *Node[K, V])
-		pushLeftBounded = func(n *Node[K, V]) {
-			curr := n
-			for curr != nil {
-				stack = append(stack, curr)
+func (n *node[K, V]) getMin() entry[K, V] {
+	current := n
+	for !current.isLeaf() {
+		current = current.children[0]
+	}
+	return current.keys[0]
+}
 
-				// Suche den ersten Key im Node, der größer oder gleich dem Minimum ist
-				idx, _ := findKey(curr.Keys, min)
-				indices = append(indices, idx)
+func (n *node[K, V]) clone() *node[K, V] {
+	if n == nil {
+		return nil
+	}
+	return &node[K, V]{
+		keys:     append([]entry[K, V](nil), n.keys...),
+		children: append([]*node[K, V](nil), n.children...),
+	}
+}
 
-				// Dem Kind-Pfad an der passenden Suchstelle nach unten folgen
-				if len(curr.Children) > idx {
-					curr = curr.Children[idx]
-				} else {
-					curr = nil
-				}
-			}
-		}
-
-		pushLeftBounded(root)
-
-		for len(stack) > 0 {
-			depth := len(stack) - 1
-			curr := stack[depth]
-			idx := indices[depth]
-
-			if idx >= len(curr.Keys) {
-				stack = stack[:depth]
-				indices = indices[:depth]
-				if len(indices) > 0 {
-					indices[len(indices)-1]++
-				}
-				continue
-			}
-
-			key := curr.Keys[idx]
-			val := curr.Values[idx]
-
-			// Da die Daten sortiert vorliegen, beenden wir sofort, sobald max überschritten wird
-			if key > max {
-				return
-			}
-
-			indices[depth]++
-			if len(curr.Children) > idx+1 {
-				pushLeftBounded(curr.Children[idx+1])
-			}
-
-			if !yield(key, val) {
-				return
-			}
-		}
+func executeBackoff(backoff *int) {
+	for i := 0; i < *backoff; i++ {
+		runtime.Gosched()
+	}
+	if *backoff < 64 {
+		*backoff <<= 1
 	}
 }
