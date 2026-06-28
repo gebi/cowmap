@@ -55,14 +55,19 @@ func (m *Map[K, V]) recycleTree(n *Node[K, V], oldRoot *Node[K, V]) {
 	m.nodePool.Put(n)
 }
 
+// cloneNode now forces deep isolation of underlying slice data,
+// making sure concurrent retries or edits cannot modify shared array footprints.
 func (m *Map[K, V]) cloneNode(src *Node[K, V]) *Node[K, V] {
 	if src == nil {
 		return nil
 	}
 	dst := m.acquireNode()
-	dst.Keys = append(dst.Keys, src.Keys...)
-	dst.Values = append(dst.Values, src.Values...)
-	dst.Children = append(dst.Children, src.Children...)
+
+	// Ensure isolated backing arrays by performing a fresh append
+	// into empty slices that have sufficient capacity (cap=3 or 4)
+	dst.Keys = append(dst.Keys[:0], src.Keys...)
+	dst.Values = append(dst.Values[:0], src.Values...)
+	dst.Children = append(dst.Children[:0], src.Children...)
 	return dst
 }
 
@@ -242,11 +247,17 @@ func (m *Map[K, V]) delete(n *Node[K, V], key K) (*Node[K, V], bool) {
 
 	// Internal Node
 	if found {
-		// Swap with successor from right subtree leaf
+		// Navigate down to find the successor leaf safely
 		successorNode := n.Children[idx+1]
 		for len(successorNode.Children) > 0 {
 			successorNode = successorNode.Children[0]
 		}
+
+		// Guard clause: make sure the leaf node isn't empty before reading index 0
+		if len(successorNode.Keys) == 0 {
+			return nil, false // Force a clean retry loop iteration
+		}
+
 		succKey := successorNode.Keys[0]
 		succVal := successorNode.Values[0]
 
@@ -254,7 +265,11 @@ func (m *Map[K, V]) delete(n *Node[K, V], key K) (*Node[K, V], bool) {
 		clone.Keys[idx] = succKey
 		clone.Values[idx] = succVal
 
-		subRoot, _ := m.delete(clone.Children[idx+1], succKey)
+		subRoot, removed := m.delete(clone.Children[idx+1], succKey)
+		if !removed {
+			m.recycleTree(clone, nil)
+			return nil, false
+		}
 		clone.Children[idx+1] = subRoot
 		return m.balanceDeletion(clone, idx+1), true
 	}
@@ -314,13 +329,18 @@ func findKey[K cmp.Ordered](slice []K, key K) (int, bool) {
 }
 
 func insertAt[T any](slice []T, idx int, val T) []T {
-	slice = append(slice, val)
+	var zero T
+	slice = append(slice, zero)
 	copy(slice[idx+1:], slice[idx:])
 	slice[idx] = val
 	return slice
 }
 
 func removeAt[T any](slice []T, idx int) []T {
+	// Guard against accidental underflows if structural sizes shifted
+	if idx < 0 || idx >= len(slice) {
+		return slice
+	}
 	return append(slice[:idx], slice[idx+1:]...)
 }
 
