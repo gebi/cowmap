@@ -6,72 +6,66 @@ import (
 	"math/bits"
 	"runtime"
 	"sync/atomic"
-	"unsafe"
 )
 
-// hashSeed is a global fixed seed ensuring consistent hashing across operations.
 var hashSeed = maphash.MakeSeed()
 
-// entry encapsulates the key-value pair.
+// numShards balances memory footprint and concurrent throughput.
+// 64 shards strip CPU cache-line bouncing cleanly across high-core systems.
+const numShards = 64
+const shardMask = numShards - 1
+const maxShift = 30
+
 type entry[K comparable, V any] struct {
 	key   K
 	value V
 }
 
-// node represents a sparse trie node. Bits set in the bitmap indicate
-// whether a child node or a direct value entry occupies that specific 5-bit slot.
-type node[K comparable, V any] struct {
-	bitmap   uint32
-	children []any // Can contain either *node[K, V] or entry[K, V]
+type collisionNode[K comparable, V any] struct {
+	entries []entry[K, V]
 }
 
-// Map implements a lock-free, thread-safe Hash Array Mapped Trie using Copy-on-Write.
+type node[K comparable, V any] struct {
+	bitmap   uint32
+	children []any
+}
+
+// Shard encapsulates an independent HAMT trie root to distribute CAS contention.
+type shard[K comparable, V any] struct {
+	root atomic.Pointer[node[K, V]]
+}
+
+// Map implements a highly concurrent, low-contention Sharded CoW HAMT.
 type Map[K comparable, V any] struct {
-	root   atomic.Pointer[node[K, V]]
+	shards [numShards]shard[K, V]
 	hasher func(K) uint32
 }
 
-// New instantiates an empty HAMT Map. It accepts an optional custom 32-bit hashing function.
-// If nil is passed, it uses a generic maphash wrapper that handles any comparable type cleanly.
+// New instantiates an empty Sharded HAMT Map.
 func NewMap[K comparable, V any](customHasher func(K) uint32) *Map[K, V] {
 	m := &Map[K, V]{}
-	m.root.Store(&node[K, V]{bitmap: 0, children: nil})
-
+	for i := 0; i < numShards; i++ {
+		m.shards[i].root.Store(&node[K, V]{bitmap: 0, children: nil})
+	}
 	if customHasher != nil {
 		m.hasher = customHasher
 	} else {
 		m.hasher = func(key K) uint32 {
-			var h maphash.Hash
-			h.SetSeed(hashSeed)
-
-			// Handle standard primitives fast paths cleanly via direct unsafe pointer matching
-			switch k := any(key).(type) {
-			case string:
-				_, _ = h.WriteString(k)
-			case int:
-				ptr := (*[unsafe.Sizeof(k)]byte)(unsafe.Pointer(&k))
-				_, _ = h.Write(ptr[:])
-			case int64:
-				ptr := (*[8]byte)(unsafe.Pointer(&k))
-				_, _ = h.Write(ptr[:])
-			default:
-				// Universal safe fallback for other comparable data types
-				// maphash.Comparable handles complex comparable structs/interfaces perfectly
-				return uint32(maphash.Comparable(hashSeed, key))
-			}
-			return uint32(h.Sum64())
+			return uint32(maphash.Comparable(hashSeed, key))
 		}
 	}
 	return m
 }
 
-// --- Snapshot Reader Operations (Lock-Free) ---
+// --- Snapshot Reader Operations (Zero Contention across Shards) ---
 
-// Get performs lock-free, zero-allocation data resolution on a constant trie snapshot.
+// Get performs zero-allocation data resolution on a constant shard snapshot.
 func (m *Map[K, V]) Get(key K) (V, bool) {
 	hash := m.hasher(key)
-	curr := m.root.Load()
-	shift := uint(0)
+	shardIdx := hash & shardMask
+
+	curr := m.shards[shardIdx].root.Load()
+	shift := uint(5) // start at 5 since first bits determined the shard
 
 	for curr != nil {
 		idx := (hash >> shift) & 0x1F
@@ -96,17 +90,30 @@ func (m *Map[K, V]) Get(key K) (V, bool) {
 			}
 			break
 		}
+
+		if col, ok := child.(*collisionNode[K, V]); ok {
+			for _, e := range col.entries {
+				if e.key == key {
+					return e.value, true
+				}
+			}
+			break
+		}
 	}
 
 	var zero V
 	return zero, false
 }
 
-// All exposes an in-order native iterator over all key-value entries present.
+// All exposes a native iterator over all elements across all shards sequentially.
 func (m *Map[K, V]) All() iter.Seq2[K, V] {
-	snapshot := m.root.Load()
 	return func(yield func(K, V) bool) {
-		snapshot.iterate(yield)
+		for i := 0; i < numShards; i++ {
+			snapshot := m.shards[i].root.Load()
+			if !snapshot.iterate(yield) {
+				return
+			}
+		}
 	}
 }
 
@@ -123,35 +130,47 @@ func (n *node[K, V]) iterate(yield func(K, V) bool) bool {
 			if !yield(kv.key, kv.value) {
 				return false
 			}
+		} else if col, ok := child.(*collisionNode[K, V]); ok {
+			for _, e := range col.entries {
+				if !yield(e.key, e.value) {
+					return false
+				}
+			}
 		}
 	}
 	return true
 }
 
-// --- Transactional Writer Operations (Lock-Free CAS Loop) ---
+// --- High-Performance Transactional Writer Operations ---
 
-// Insert introduces or updates a value matching the targeted key identifier via a CAS retry loop.
+// Insert targets a specific internal shard root, reducing global CPU cache invalidation.
 func (m *Map[K, V]) Insert(key K, value V) {
 	hash := m.hasher(key)
+	shardIdx := hash & shardMask
+	targetShard := &m.shards[shardIdx]
+
 	backoff := 1
 	for {
-		currentRoot := m.root.Load()
-		newRoot := currentRoot.insert(hash, 0, key, value, m.hasher)
+		currentRoot := targetShard.root.Load()
+		newRoot := currentRoot.insert(hash, 5, key, value, m.hasher)
 
-		if m.root.CompareAndSwap(currentRoot, newRoot) {
+		if targetShard.root.CompareAndSwap(currentRoot, newRoot) {
 			return
 		}
 		executeBackoff(&backoff)
 	}
 }
 
-// Delete drops a key target and structurally updates the underlying bitmask arrays.
+// Delete drops an element out of its isolated sub-shard structure.
 func (m *Map[K, V]) Delete(key K) bool {
 	hash := m.hasher(key)
+	shardIdx := hash & shardMask
+	targetShard := &m.shards[shardIdx]
+
 	backoff := 1
 	for {
-		currentRoot := m.root.Load()
-		newRoot, found := currentRoot.delete(hash, 0, key)
+		currentRoot := targetShard.root.Load()
+		newRoot, found := currentRoot.delete(hash, 5, key)
 		if !found {
 			return false
 		}
@@ -159,7 +178,7 @@ func (m *Map[K, V]) Delete(key K) bool {
 			newRoot = &node[K, V]{bitmap: 0, children: nil}
 		}
 
-		if m.root.CompareAndSwap(currentRoot, newRoot) {
+		if targetShard.root.CompareAndSwap(currentRoot, newRoot) {
 			return true
 		}
 		executeBackoff(&backoff)
@@ -175,7 +194,6 @@ func (n *node[K, V]) insert(hash uint32, shift uint, key K, value V, hasher func
 
 	cloned := n.clone()
 
-	// Slot is entirely empty: insert direct value entry
 	if (cloned.bitmap & mask) == 0 {
 		cloned.bitmap |= mask
 		cloned.children = append(cloned.children, nil)
@@ -186,29 +204,51 @@ func (n *node[K, V]) insert(hash uint32, shift uint, key K, value V, hasher func
 
 	child := cloned.children[pos]
 
-	// Slot holds another sub-node: propagate downwards recursively
 	if subNode, ok := child.(*node[K, V]); ok {
 		cloned.children[pos] = subNode.insert(hash, shift+5, key, value, hasher)
 		return cloned
 	}
 
-	// Slot holds an existing key-value entry
 	if existingKV, ok := child.(entry[K, V]); ok {
 		if existingKV.key == key {
-			// Exact key collision match: overwrite value in place on the clone
 			cloned.children[pos] = entry[K, V]{key: key, value: value}
 			return cloned
 		}
 
-		// Hash index collision across different keys: push down to sub-node level
+		if shift >= maxShift {
+			cloned.children[pos] = &collisionNode[K, V]{
+				entries: []entry[K, V]{existingKV, {key: key, value: value}},
+			}
+			return cloned
+		}
+
 		subNode := &node[K, V]{bitmap: 0, children: nil}
 		subHash := hasher(existingKV.key)
-
-		// Rehash existing and new keys downwards inside structural helper
 		subNode = subNode.insert(subHash, shift+5, existingKV.key, existingKV.value, hasher)
 		subNode = subNode.insert(hash, shift+5, key, value, hasher)
 
 		cloned.children[pos] = subNode
+		return cloned
+	}
+
+	if colNode, ok := child.(*collisionNode[K, V]); ok {
+		newCol := &collisionNode[K, V]{
+			entries: make([]entry[K, V], len(colNode.entries)),
+		}
+		copy(newCol.entries, colNode.entries)
+
+		updated := false
+		for i, e := range newCol.entries {
+			if e.key == key {
+				newCol.entries[i].value = value
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			newCol.entries = append(newCol.entries, entry[K, V]{key: key, value: value})
+		}
+		cloned.children[pos] = newCol
 		return cloned
 	}
 
@@ -234,7 +274,6 @@ func (n *node[K, V]) delete(hash uint32, shift uint, key K) (*node[K, V], bool) 
 			return n, false
 		}
 
-		// Node compression: cleanup single entry child trees
 		if newSub == nil || len(newSub.children) == 0 {
 			cloned.bitmap &^= mask
 			cloned.children = append(cloned.children[:pos], cloned.children[pos+1:]...)
@@ -265,16 +304,44 @@ func (n *node[K, V]) delete(hash uint32, shift uint, key K) (*node[K, V], bool) 
 		}
 	}
 
+	if colNode, ok := child.(*collisionNode[K, V]); ok {
+		idxToRemove := -1
+		for i, e := range colNode.entries {
+			if e.key == key {
+				idxToRemove = i
+				break
+			}
+		}
+		if idxToRemove == -1 {
+			return n, false
+		}
+
+		if len(colNode.entries) == 2 {
+			remIdx := 1 - idxToRemove
+			cloned.children[pos] = colNode.entries[remIdx]
+		} else {
+			newCol := &collisionNode[K, V]{
+				entries: make([]entry[K, V], 0, len(colNode.entries)-1),
+			}
+			newCol.entries = append(newCol.entries, colNode.entries[:idxToRemove]...)
+			newCol.entries = append(newCol.entries, colNode.entries[idxToRemove+1:]...)
+			cloned.children[pos] = newCol
+		}
+		return cloned, true
+	}
+
 	return n, false
 }
 
-// --- Mechanics & Concurrency Allocators ---
+// --- Allocation Optimizations ---
 
 func (n *node[K, V]) clone() *node[K, V] {
 	if n == nil {
 		return nil
 	}
-	newChildren := make([]any, len(n.children))
+
+	// Fast optimization: Pre-allocate capacity cleanly to minimize slice growing cost
+	newChildren := make([]any, len(n.children), len(n.children)+1)
 	copy(newChildren, n.children)
 	return &node[K, V]{
 		bitmap:   n.bitmap,
@@ -283,10 +350,11 @@ func (n *node[K, V]) clone() *node[K, V] {
 }
 
 func executeBackoff(backoff *int) {
+	// Active spin loop using runtime hints helps threads clear the CAS choke quickly
 	for i := 0; i < *backoff; i++ {
 		runtime.Gosched()
 	}
-	if *backoff < 64 {
+	if *backoff < 32 {
 		*backoff <<= 1
 	}
 }
