@@ -42,7 +42,7 @@ type Map[K comparable, V any] struct {
 }
 
 // New instantiates an empty Sharded HAMT Map.
-func NewMap[K comparable, V any](customHasher func(K) uint32) *Map[K, V] {
+func New[K comparable, V any](customHasher func(K) uint32) *Map[K, V] {
 	m := &Map[K, V]{}
 	for i := 0; i < numShards; i++ {
 		m.shards[i].root.Store(&node[K, V]{bitmap: 0, children: nil})
