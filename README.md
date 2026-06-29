@@ -48,7 +48,9 @@ This mapping divides thread contention by up to 98% on multi-core systems, isola
 Inside each shard, entries are arranged within a sparse prefix-trie.
 * **Branching Factor:** Each node features a 32-way branching layout ($W=32$).
 * **Bitmapped Populating:** Instead of a bloated 32-slot pointer array, nodes use a single `uint32` bitmap coupled with a packed, variable-length storage slice. The exact offset of an active index is determined via bitwise population counting:
-  $$\text{Index Position} = \text{bits.OnesCount32}(\text{Bitmap} \ \& \ (\text{Mask} - 1))$$
+
+$$ \text{Index Position} = \text{bits.OnesCount32}( \text{Bitmap} \ \\& \ (\text{Mask} - 1)) $$
+  
 * **Shallow Traversal Depth:** Traversal uses a 5-bit window per tier. For a standard 32-bit hash space, the structure guarantees a maximum depth of 7 hops.
 
 ### 3. Read-Copy-Update (RCU) & Path-Copying
